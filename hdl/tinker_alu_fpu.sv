@@ -27,40 +27,87 @@ module tinker_alu_fpu(
 
     localparam QUIET_NAN  = 64'h7ff8_0000_0000_0000;
 
-    assign a_is_zero      = (a == 64'd0);
-    assign a_gt_b_signed  = ($signed(a) > $signed(b));
+    assign a_is_zero     = (a == 64'd0);
+    assign a_gt_b_signed = ($signed(a) > $signed(b));
 
     function automatic is_nan64(input [63:0] x);
-        begin
-            is_nan64 = (x[62:52] == 11'h7ff) && (x[51:0] != 0);
-        end
+        begin is_nan64 = (x[62:52] == 11'h7ff) && (x[51:0] != 0); end
     endfunction
 
     function automatic is_inf64(input [63:0] x);
-        begin
-            is_inf64 = (x[62:52] == 11'h7ff) && (x[51:0] == 0);
-        end
+        begin is_inf64 = (x[62:52] == 11'h7ff) && (x[51:0] == 0); end
     endfunction
 
     function automatic is_zero64(input [63:0] x);
+        begin is_zero64 = (x[62:52] == 0) && (x[51:0] == 0); end
+    endfunction
+
+    function automatic [55:0] shr_sticky56;
+        input [55:0] x;
+        input integer sh;
+        reg [55:0] tmp;
+        reg sticky;
+        integer i;
         begin
-            is_zero64 = (x[62:52] == 0) && (x[51:0] == 0);
+            if (sh <= 0) begin
+                shr_sticky56 = x;
+            end else if (sh >= 56) begin
+                shr_sticky56 = (x != 0) ? 56'd1 : 56'd0;
+            end else begin
+                tmp = x >> sh;
+                sticky = 1'b0;
+                for (i = 0; i < sh; i = i + 1)
+                    sticky = sticky | x[i];
+                tmp[0] = tmp[0] | sticky;
+                shr_sticky56 = tmp;
+            end
         end
     endfunction
 
-    function automatic [63:0] pack_fp;
+    function automatic [63:0] pack_rne64;
         input sign;
         input integer exp_unbiased;
-        input [52:0] sig;
+        input [55:0] ext;   // {53 sig bits, guard, round, sticky}
+        reg [55:0] ext_r;
+        reg [52:0] sig_main;
+        reg guard, roundb, sticky;
+        reg inc;
+        reg [53:0] sig_round;
+        integer exp_r, sh;
         begin
-            if (sig == 0) begin
-                pack_fp = 64'd0;
-            end else if (exp_unbiased + 1023 >= 2047) begin
-                pack_fp = {sign, 11'h7ff, 52'd0};
-            end else if (exp_unbiased + 1023 <= 0) begin
-                pack_fp = 64'd0; // TODO: Subnormals
+            ext_r = ext;
+            exp_r = exp_unbiased;
+
+            if ((exp_r < -1022) || ((exp_r == -1022) && (ext_r[55] == 1'b0))) begin
+                sh = -1022 - exp_r;
+                if (sh < 0) sh = 0;
+                ext_r = shr_sticky56(ext_r, sh);
+                exp_r = -1022;
+            end
+
+            sig_main = ext_r[55:3];
+            guard    = ext_r[2];
+            roundb   = ext_r[1];
+            sticky   = ext_r[0];
+
+            inc = guard && (roundb || sticky || sig_main[0]); // rounding
+            sig_round = {1'b0, sig_main} + inc;
+
+            if (sig_round == 0) begin
+                pack_rne64 = 64'd0;
+            end else if (sig_round[53]) begin
+                sig_round = sig_round >> 1;
+                exp_r = exp_r + 1;
+                if (exp_r + 1023 >= 2047)
+                    pack_rne64 = {sign, 11'h7ff, 52'd0};
+                else
+                    pack_rne64 = {sign, exp_r[10:0] + 11'd1023, sig_round[51:0]};
+            end else if ((exp_r == -1022) && (sig_round[52] == 1'b0)) begin
+                pack_rne64 = {sign, 11'd0, sig_round[51:0]};   // subnormal
+            end else if (exp_r + 1023 >= 2047) begin
+                pack_rne64 = {sign, 11'h7ff, 52'd0};
             end else begin
-                pack_fp = {sign, exp_unbiased[10:0] + 11'd1023, sig[51:0]};
+                pack_rne64 = {sign, exp_r[10:0] + 11'd1023, sig_round[51:0]};
             end
         end
     endfunction
@@ -69,12 +116,14 @@ module tinker_alu_fpu(
         input [63:0] x;
         input [63:0] y;
         input sub;
-        reg sx, sy, sr;
+        reg [63:0] y2;
+        reg sx, sy, sr, s_big, s_small;
         reg [10:0] ex, ey;
         reg [51:0] fx, fy;
-        reg [52:0] mx, my, mr;
-        integer e1, e2, er, shift, i;
-        reg [63:0] y2;
+        reg [52:0] mx, my, m_big, m_small;
+        reg [55:0] ex_big, ex_small, ex_res;
+        reg [56:0] sum57;
+        integer e1, e2, er, sh;
         begin
             y2 = sub ? {~y[63], y[62:0]} : y;
 
@@ -86,72 +135,56 @@ module tinker_alu_fpu(
                 fp_addsub64 = x;
             end else if (is_inf64(y2)) begin
                 fp_addsub64 = y2;
-            end else if (is_zero64(x)) begin
-                fp_addsub64 = y2;
-            end else if (is_zero64(y2)) begin
-                fp_addsub64 = x;
+            end else if (is_zero64(x) && is_zero64(y2)) begin
+                fp_addsub64 = 64'd0;
             end else begin
                 sx = x[63]; sy = y2[63];
                 ex = x[62:52]; ey = y2[62:52];
                 fx = x[51:0]; fy = y2[51:0];
 
-                // Subnormals = 0 for now
-                if (ex == 0 || ey == 0) begin
-                    fp_addsub64 = 64'd0;
+                e1 = (ex == 0) ? -1022 : (ex - 1023);
+                e2 = (ey == 0) ? -1022 : (ey - 1023);
+
+                mx = (ex == 0) ? {1'b0, fx} : {1'b1, fx};
+                my = (ey == 0) ? {1'b0, fy} : {1'b1, fy};
+
+                if ((e1 > e2) || ((e1 == e2) && (mx >= my))) begin
+                    e_big = e1; m_big = mx; s_big = sx;
+                    e_small = e2; m_small = my; s_small = sy;
                 end else begin
-                    e1 = ex - 1023;
-                    e2 = ey - 1023;
-                    mx = {1'b1, fx};
-                    my = {1'b1, fy};
+                    e_big = e2; m_big = my; s_big = sy;
+                    e_small = e1; m_small = mx; s_small = sx;
+                end
 
-                    if (e1 > e2) begin
-                        shift = e1 - e2;
-                        if (shift > 52) my = 0;
-                        else my = my >> shift;
-                        er = e1;
-                    end else if (e2 > e1) begin
-                        shift = e2 - e1;
-                        if (shift > 52) mx = 0;
-                        else mx = mx >> shift;
-                        er = e2;
+                er = e_big;
+                ex_big = {m_big, 3'b000};
+                sh = e_big - e_small;
+                ex_small = shr_sticky56({m_small, 3'b000}, sh);
+
+                if (s_big == s_small) begin
+                    sum57 = {1'b0, ex_big} + {1'b0, ex_small};
+                    sr = s_big;
+                    if (sum57[56]) begin
+                        ex_res = sum57[56:1];
+                        ex_res[0] = ex_res[0] | sum57[0];
+                        er = er + 1;
                     end else begin
-                        er = e1;
+                        ex_res = sum57[55:0];
                     end
-
-                    if (sx == sy) begin
-                        mr = mx + my;
-                        sr = sx;
-                        if (mr[52]) begin
-                            // already normalized or overflowed into bit 52
-                        end
-                        if (mr[52] && (mr >= 53'h2_0000_0000_0000)) begin
-                            mr = mr >> 1;
-                            er = er + 1;
-                        end
-                    end else begin
-                        if (mx >= my) begin
-                            mr = mx - my;
-                            sr = sx;
-                        end else begin
-                            mr = my - mx;
-                            sr = sy;
-                        end
-
-                        if (mr == 0) begin
-                            fp_addsub64 = 64'd0;
-                        end
-
-                        while ((mr[52] == 0) && (er > -1022)) begin
-                            mr = mr << 1;
-                            er = er - 1;
-                        end
-                    end
-
-                    fp_addsub64 = pack_fp(sr, er, mr);
-                    if (mr == 0) begin
+                end else begin
+                    ex_res = ex_big - ex_small;
+                    sr = s_big;
+                    if (ex_res == 0) begin
                         fp_addsub64 = 64'd0;
+                        disable fp_addsub64;
+                    end
+                    while ((ex_res[55] == 1'b0) && (er > -1022)) begin
+                        ex_res = ex_res << 1;
+                        er = er - 1;
                     end
                 end
+
+                fp_addsub64 = pack_rne64(sr, er, ex_res);
             end
         end
     endfunction
@@ -161,10 +194,10 @@ module tinker_alu_fpu(
         input [63:0] y;
         reg sx, sy, sr;
         reg [10:0] ex, ey;
-        reg [51:0] fx, fy;
-        reg [52:0] mx, my, mr;
+        reg [52:0] mx, my;
         reg [105:0] prod;
-        integer er;
+        reg [55:0] ext;
+        integer e1, e2, er;
         begin
             if (is_nan64(x) || is_nan64(y)) begin
                 fp_mul64 = QUIET_NAN;
@@ -177,25 +210,24 @@ module tinker_alu_fpu(
             end else begin
                 sx = x[63]; sy = y[63]; sr = sx ^ sy;
                 ex = x[62:52]; ey = y[62:52];
-                fx = x[51:0]; fy = y[51:0];
 
-                if (ex == 0 || ey == 0) begin
-                    fp_mul64 = 64'd0; // ignore subnormals for now
+                e1 = (ex == 0) ? -1022 : (ex - 1023);
+                e2 = (ey == 0) ? -1022 : (ey - 1023);
+
+                mx = (ex == 0) ? {1'b0, x[51:0]} : {1'b1, x[51:0]};
+                my = (ey == 0) ? {1'b0, y[51:0]} : {1'b1, y[51:0]};
+
+                prod = mx * my;
+                er = e1 + e2;
+
+                if (prod[105]) begin
+                    ext = {prod[105:53], prod[52], prod[51], |prod[50:0]};
+                    er = er + 1;
                 end else begin
-                    mx = {1'b1, fx};
-                    my = {1'b1, fy};
-                    prod = mx * my;
-                    er = (ex - 1023) + (ey - 1023);
-
-                    if (prod[105]) begin
-                        mr = prod[105:53];
-                        er = er + 1;
-                    end else begin
-                        mr = prod[104:52];
-                    end
-
-                    fp_mul64 = pack_fp(sr, er, mr);
+                    ext = {prod[104:52], prod[51], prod[50], |prod[49:0]};
                 end
+
+                fp_mul64 = pack_rne64(sr, er, ext);
             end
         end
     endfunction
@@ -205,10 +237,11 @@ module tinker_alu_fpu(
         input [63:0] y;
         reg sx, sy, sr;
         reg [10:0] ex, ey;
-        reg [51:0] fx, fy;
-        reg [52:0] mx, my, mr;
-        reg [105:0] num;
-        integer er;
+        reg [52:0] mx, my;
+        reg [108:0] num;
+        reg [55:0] q;
+        reg [52:0] rem;
+        integer e1, e2, er;
         begin
             if (is_nan64(x) || is_nan64(y)) begin
                 fp_div64 = QUIET_NAN;
@@ -225,25 +258,25 @@ module tinker_alu_fpu(
             end else begin
                 sx = x[63]; sy = y[63]; sr = sx ^ sy;
                 ex = x[62:52]; ey = y[62:52];
-                fx = x[51:0]; fy = y[51:0];
 
-                if (ex == 0 || ey == 0) begin
-                    fp_div64 = 64'd0; // ignore subnormals for now
-                end else begin
-                    mx = {1'b1, fx};
-                    my = {1'b1, fy};
-                    er = (ex - 1023) - (ey - 1023);
+                e1 = (ex == 0) ? -1022 : (ex - 1023);
+                e2 = (ey == 0) ? -1022 : (ey - 1023);
 
-                    num = ({53'd0, mx} << 52);
-                    mr = num / my;
+                mx = (ex == 0) ? {1'b0, x[51:0]} : {1'b1, x[51:0]};
+                my = (ey == 0) ? {1'b0, y[51:0]} : {1'b1, y[51:0]};
 
-                    if (mr[52] == 0) begin
-                        mr = mr << 1;
-                        er = er - 1;
-                    end
+                er = e1 - e2;
+                num = {mx, 56'd0};
+                q = num / my;
+                rem = num % my;
 
-                    fp_div64 = pack_fp(sr, er, mr);
+                if (q[55] == 1'b0) begin
+                    q = q << 1;
+                    er = er - 1;
                 end
+                q[0] = q[0] | (rem != 0);
+
+                fp_div64 = pack_rne64(sr, er, q);
             end
         end
     endfunction
