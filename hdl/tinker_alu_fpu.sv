@@ -148,6 +148,9 @@ module tinker_alu_fpu(
                     end
 
                     fp_addsub64 = pack_fp(sr, er, mr);
+                    if (mr == 0) begin
+                        fp_addsub64 = 64'd0;
+                    end
                 end
             end
         end
